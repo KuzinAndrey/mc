@@ -102,6 +102,7 @@ edit_options_t edit_options = {
     .show_right_margin = FALSE,
     .simple_statusbar = FALSE,
     .check_nl_at_eof = FALSE,
+    .git_blame_for_lines = FALSE,
 };
 
 int max_undo = 32768;
