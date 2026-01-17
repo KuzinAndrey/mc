@@ -60,6 +60,7 @@ typedef struct
     gboolean show_right_margin;
     gboolean simple_statusbar;  // statusbar draw style
     gboolean check_nl_at_eof;
+    gboolean git_blame_for_lines;
 } edit_options_t;
 
 typedef struct
