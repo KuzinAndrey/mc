@@ -40,6 +40,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <libgen.h>
+#include <time.h>
 
 #include "lib/global.h"
 #include "lib/tty/tty.h"  // tty_printf()
@@ -71,6 +73,14 @@
 #define key_pending(x)                (!is_idle ())
 
 #define EDITOR_MINIMUM_TERMINAL_WIDTH 30
+
+static char git_commit_hash[41] = {0};
+static char git_author[256] = {0};
+static char git_author_email[256] = {0};
+static char git_title[256] = {0};
+static char git_date[64] = {0};
+static char git_tz[6] = {0};
+long git_line = 0;
 
 /*** file scope type declarations ****************************************************************/
 
@@ -185,6 +195,82 @@ status_string (WEdit *edit, char *s, int w)
     g_free (character_code);
 }
 
+static inline void
+gitblame_string (WEdit *edit, char *s, int w, const char *fname)
+{
+    char current_dir[MC_MAXPATHLEN];
+    char buf[1024];
+    long line = edit->buffer.curs_line + 1;
+    char *git_dir = NULL;
+    char *dir;
+    char *git_file = NULL;
+    char *file;
+    char cmd[MC_MAXPATHLEN];
+    FILE *gitcmd = NULL;
+    int gitret = -1;
+
+    if (git_line > 0 && git_line == line) goto fill;
+
+    git_dir = strdup(fname);
+    git_file = strdup(fname);
+
+    if (!getcwd (current_dir, sizeof(current_dir) - 1))
+         return;
+
+    if (!git_dir || !git_file) goto exit;
+
+    dir = dirname(git_dir);
+    file = basename(git_file);
+
+    if (chdir (dir) != 0) goto exit;
+    if (snprintf(cmd, sizeof(cmd), "git blame -p -L %ld,%ld %s 2>&1", line, line, file) >= (int)sizeof(cmd)) goto exit;
+    if (chdir (current_dir) != 0) return;
+
+    gitcmd = popen (cmd, "r");
+    if (gitcmd == NULL) goto exit;
+
+    while (fgets(buf, sizeof(buf), gitcmd)) {
+        buf[strcspn(buf, "\n")] = 0;
+        if (buf[0] == '\t') continue;
+        if (git_commit_hash[0] == '\0' && isxdigit(buf[0]) && strlen(buf) >= 40 && (buf[40] == ' ' || buf[40] == '\0')) {
+            strncpy(git_commit_hash, buf, 10);
+            git_commit_hash[10] = '\0';
+            continue;
+        }
+
+        char *space = strchr(buf, ' ');
+        if (space) {
+            *space = '\0';
+            char *key = buf;
+            char *value = space + 1;
+            if (strcmp(key, "author") == 0) {
+                 snprintf(git_author, sizeof(git_author), "%s", value);
+            } else if (strcmp(key, "author-mail") == 0) {
+                 snprintf(git_author_email, sizeof(git_author_email), "%s", value);
+            } else if (strcmp(key, "author-time") == 0) {
+                 time_t t = atoll(value);
+                 struct tm tmst = {0};
+                 if (localtime_r(&t, &tmst))
+                     strftime(git_date, sizeof(git_date), "%Y-%m-%d %H:%M", &tmst);
+            } else if (strcmp(key, "author-tz") == 0) {
+                 snprintf(git_tz, sizeof(git_tz), "%s", value);
+            } else if (strcmp(key, "summary") == 0) {
+                 snprintf(git_title, sizeof(git_title), "%s", value);
+            }
+        }
+    }
+    gitret = pclose (gitcmd);
+    if (gitret != 0) goto exit;
+    git_line = line;
+
+fill:
+    g_snprintf (s, w, "Blame: %s %s %s %s %s - %s",
+                git_commit_hash, git_author, git_author_email, git_date, git_tz, git_title);
+exit:
+    if (git_dir) free(git_dir);
+    if (git_file) free(git_file);
+}
+
 /* --------------------------------------------------------------------------------------------- */
 /**
  * Draw the status line at the top of the screen for fullscreen editor window.
@@ -202,6 +288,7 @@ edit_status_fullscreen (WEdit *edit, int color)
     const int right_gap = 5;  // at the right end of the screen
     const int preferred_fname_len = 16;
     char *status;
+    char *gitblame = NULL;
     size_t status_size;
     int status_len;
     const char *fname = "";
@@ -218,6 +305,11 @@ edit_status_fullscreen (WEdit *edit, int color)
 
         if (!edit_options.state_full_filename)
             fname = x_basename (fname);
+    }
+
+    if (edit_options.git_blame_for_lines) {
+        gitblame = g_malloc (status_size);
+        gitblame_string (edit, gitblame, status_size, fname);
     }
 
     fname_len = str_term_width1 (fname);
@@ -238,6 +330,12 @@ edit_status_fullscreen (WEdit *edit, int color)
     printwstr (fname, fname_len + gap);
     printwstr (status, w - (fname_len + gap));
 
+    if (edit_options.git_blame_for_lines) {
+        widget_gotoyx (h, 1, 0);
+        tty_setcolor (color);
+        printwstr (gitblame, w);
+    }
+
     if (edit_options.simple_statusbar && w > EDITOR_MINIMUM_TERMINAL_WIDTH)
     {
         int percent;
@@ -248,6 +346,7 @@ edit_status_fullscreen (WEdit *edit, int color)
     }
 
     g_free (status);
+    if (edit_options.git_blame_for_lines) g_free (gitblame);
 }
 
 /* --------------------------------------------------------------------------------------------- */

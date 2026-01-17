@@ -184,6 +184,8 @@ edit_options_dialog (WDialog *h)
                     QUICK_CHECKBOX (_ ("&Group undo"), &edit_options.group_undo, NULL),
                     QUICK_LABELED_INPUT (_ ("Word wrap line length:"), input_label_left, wrap_length,
                                          "edit-word-wrap", &p, NULL, FALSE, FALSE, INPUT_COMPLETE_NONE),
+                    QUICK_CHECKBOX (_ ("Git blame for lines"),
+                                    &edit_options.git_blame_for_lines, NULL),
                 QUICK_STOP_GROUPBOX,
             QUICK_STOP_COLUMNS,
             QUICK_BUTTONS_OK_CANCEL,
