@@ -36,6 +36,7 @@ SKINS = \
 	seasons-spring16M.ini \
 	seasons-summer16M.ini \
 	seasons-winter16M.ini \
+	tokyo-night-16M.ini \
 	xoria256-thin.ini \
 	xoria256.ini \
 	xoria256root-thin.ini \
