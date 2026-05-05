@@ -233,7 +233,7 @@ extfs_find_entry_int (struct vfs_s_inode *dir, const char *name, GSList *list, i
 {
     struct vfs_s_entry *pent, *pdir;
     const char *p, *name_end;
-    char *q;
+    char *name_copy;
     char c = PATH_SEP;
     struct extfs_super_t *super;
 
@@ -246,17 +246,21 @@ extfs_find_entry_int (struct vfs_s_inode *dir, const char *name, GSList *list, i
 
     super = EXTFS_SUPER (dir->super);
     pent = dir->ent;
-    p = name;
-    name_end = name + strlen (name);
+
+    const size_t name_len = strlen (name);
+
+    name_copy = g_strndup (name, name_len);
+    p = name_copy;
+    name_end = name_copy + name_len;
 
     while ((pent != NULL) && (c != '\0') && (*p != '\0'))
     {
-        q = strchr (p, PATH_SEP);
+        const char *q = strchr (p, PATH_SEP);
         if (q == NULL)
-            q = (char *) name_end;
+            q = name_end;
 
         c = *q;
-        *q = '\0';
+        name_copy[q - name_copy] = '\0';
 
         if (DIR_IS_DOTDOT (p))
             pent = pent->dir != NULL ? pent->dir->ent : NULL;
@@ -267,14 +271,14 @@ extfs_find_entry_int (struct vfs_s_inode *dir, const char *name, GSList *list, i
             pent = extfs_resolve_symlinks_int (pent, list);
             if (pent == NULL)
             {
-                *q = c;
+                g_free (name_copy);
                 return NULL;
             }
 
             if (!S_ISDIR (pent->ino->st.st_mode))
             {
-                *q = c;
                 notadir = TRUE;
+                g_free (name_copy);
                 return NULL;
             }
 
@@ -283,9 +287,9 @@ extfs_find_entry_int (struct vfs_s_inode *dir, const char *name, GSList *list, i
             pent = pl != NULL ? VFS_ENTRY (pl->data) : NULL;
             if (pent != NULL && q + 1 > name_end)
             {
-                // Hack: I keep the original semanthic unless q+1 would break in the strchr
-                *q = c;
+                // Hack: I keep the original semantic unless q+1 would break in the strchr
                 notadir = !S_ISDIR (pent->ino->st.st_mode);
+                g_free (name_copy);
                 return pent;
             }
 
@@ -297,12 +301,16 @@ extfs_find_entry_int (struct vfs_s_inode *dir, const char *name, GSList *list, i
         }
 
         // Next iteration
-        *q = c;
+        name_copy[q - name_copy] = c;
         if (c != '\0')
             p = q + 1;
     }
+
+    g_free (name_copy);
+
     if (pent == NULL)
         my_errno = ENOENT;
+
     return pent;
 }
 
