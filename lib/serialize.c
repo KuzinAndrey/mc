@@ -80,10 +80,10 @@ static const char *
 go_to_end_of_serialized_string (const char *non_serialized_data,
                                 const char *already_serialized_part, size_t *offset)
 {
-    size_t calculated_offset;
     const char *semi_ptr = strchr (non_serialized_data + 1, SRLZ_DELIM_C);
+    const size_t calculated_offset =
+        (semi_ptr - non_serialized_data) + 1 + strlen (already_serialized_part);
 
-    calculated_offset = (semi_ptr - non_serialized_data) + 1 + strlen (already_serialized_part);
     if (calculated_offset >= strlen (non_serialized_data))
         return NULL;
 
@@ -149,17 +149,16 @@ mc_deserialize_str (const char prefix, const char *data, GError **error)
 
     {
         char buffer[BUF_TINY];
-        char *semi_ptr;
-        size_t semi_offset;
 
-        semi_ptr = strchr (data + 1, SRLZ_DELIM_C);
+        const char *semi_ptr = strchr (data + 1, SRLZ_DELIM_C);
         if (semi_ptr == NULL)
         {
             g_set_error (error, MC_ERROR, 0, FUNC_NAME ": Length delimiter '%c' doesn't exists",
                          SRLZ_DELIM_C);
             return NULL;
         }
-        semi_offset = semi_ptr - (data + 1);
+
+        const size_t semi_offset = semi_ptr - (data + 1);
         if (semi_offset >= BUF_TINY)
         {
             g_set_error (error, MC_ERROR, 0, FUNC_NAME ": Too big string length");
