@@ -346,7 +346,6 @@ vfs_path_from_str_deprecated_parser (char *path)
 
     while ((class = _vfs_split_with_semi_skip_count (path, &local, &op, 0)) != NULL)
     {
-        char *url_params;
         element = g_new0 (vfs_path_element_t, 1);
         element->class = class;
         if (local == NULL)
@@ -357,10 +356,10 @@ vfs_path_from_str_deprecated_parser (char *path)
         element->dir.converter =
             (element->encoding != NULL) ? str_crt_conv_from (element->encoding) : INVALID_CONV;
 
-        url_params = strchr (op, ':');  // skip VFS prefix
+        const char *url_params = strchr (op, ':');  // skip VFS prefix
         if (url_params != NULL)
         {
-            *url_params = '\0';
+            path[url_params - path] = '\0';  // truncate the path
             url_params++;
             vfs_path_url_split (element, url_params);
         }

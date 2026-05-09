@@ -1169,9 +1169,7 @@ find_ignore_dir_search (const char *dir, size_t len)
                 break;
             case 1:  // dir is absolute, ignore_dir is relative
             {
-                char *d;
-
-                d = strstr (dir, *ignore_dir);
+                const char *d = strstr (dir, *ignore_dir);
                 if (d != NULL && IS_PATH_SEP (d[-1]) && (d[ilen] == '\0' || IS_PATH_SEP (d[ilen])))
                     return TRUE;
             }
@@ -1179,7 +1177,7 @@ find_ignore_dir_search (const char *dir, size_t len)
             case 2:  // dir is relative, ignore_dir is absolute
                 // FIXME: skip this case
                 break;
-            default:  // this cannot occurs
+            default:  // this cannot occur
                 return FALSE;
             }
         }
