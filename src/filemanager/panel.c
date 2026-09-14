@@ -36,6 +36,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>    // read (), close (), access ()
+#include <fcntl.h>     // open (), O_RDONLY
+#include <sys/stat.h>  // stat (), fstat ()
 
 #include "lib/global.h"
 
@@ -1047,62 +1051,260 @@ mini_info_separator (const WPanel *panel)
 
 /* --------------------------------------------------------------------------------------------- */
 
+/* How often the branch is re-checked while the panel stays in the same
+ * directory: quickly for git directories (so that a 'git checkout' run in
+ * the subshell or in another terminal shows up without a directory change),
+ * rarely for non-git directories (a repository does not appear by itself). */
+#define GIT_BRANCH_REFRESH_SECS       2
+#define GIT_BRANCH_NOGIT_REFRESH_SECS 10
+
+/**
+ * Find the git directory of the repository containing 'start_dir', walking
+ * up the directory tree (the panel may be in a subdirectory of the project).
+ * Handles a regular repository (.git is a directory) and submodules / linked
+ * worktrees (.git is a file containing 'gitdir: <path>').
+ * On success fills 'gitdir' (absolute path) and returns TRUE, otherwise
+ * empties 'gitdir' and returns FALSE.
+ * Uses only stat()/read() syscalls — no external tool is spawned, so no
+ * SIGCHLD can race with the subshell's stop/synchronize protocol.
+ */
+static gboolean
+git_branch_find_gitdir (const char *start_dir, char *gitdir, size_t gitdir_size)
+{
+    char path[MC_MAXPATHLEN * 2];
+    char parent[MC_MAXPATHLEN];
+    const char *d = start_dir;
+
+    for (;;)
+    {
+        struct stat st;
+
+        if (strlen (d) + sizeof ("/.git") <= sizeof (path))
+        {
+            g_strlcpy (path, d, sizeof (path));
+            strcat (path, "/.git");
+
+            if (stat (path, &st) == 0)
+            {
+                if (S_ISDIR (st.st_mode))
+                {
+                    g_strlcpy (gitdir, path, gitdir_size);
+                    return TRUE;
+                }
+
+                if (S_ISREG (st.st_mode))
+                {
+                    // Submodule / worktree: .git is a file with 'gitdir: <path>'
+                    FILE *f = fopen (path, "r");
+
+                    if (f != NULL)
+                    {
+                        char line[MC_MAXPATHLEN];
+
+                        if (fgets (line, sizeof (line), f) != NULL
+                            && strncmp (line, "gitdir: ", 8) == 0)
+                        {
+                            char *p = line + 8;
+                            size_t n = strlen (p);
+
+                            while (n > 0
+                                   && (p[n - 1] == '\n' || p[n - 1] == '\r' || p[n - 1] == ' '))
+                                p[--n] = '\0';
+
+                            if (p[0] == '\0')
+                                ;  // malformed, keep walking up
+                            else if (p[0] == '/')
+                            {
+                                g_strlcpy (gitdir, p, gitdir_size);
+                                fclose (f);
+                                return TRUE;
+                            }
+                            else if (strlen (d) + 1 + n + 1 <= gitdir_size)
+                            {
+                                g_strlcpy (gitdir, d, gitdir_size);
+                                strcat (gitdir, "/");
+                                strcat (gitdir, p);
+                                fclose (f);
+                                return TRUE;
+                            }
+                        }
+                        fclose (f);
+                    }
+                }
+            }
+        }
+
+        if (strcmp (d, "/") == 0)
+            break;
+
+        g_strlcpy (parent, d, sizeof (parent));
+
+        char *slash = strrchr (parent, '/');
+
+        if (slash == NULL || slash == parent)
+            break;
+
+        if (slash == parent + 1)
+            parent[2] = '\0';  // "/foo" -> "/"
+        else
+            slash[0] = '\0';
+
+        d = parent;
+    }
+
+    gitdir[0] = '\0';
+    return FALSE;
+}
+
+/**
+ * Read the current branch from '<gitdir>/HEAD', mimicking
+ * 'git branch --show-current': 'ref: refs/heads/<name>' yields '<name>',
+ * anything else (detached HEAD, some other ref) yields "".
+ * Also stores HEAD's stat() so the caller can cheaply detect a later
+ * branch change (git checkout, reset --hard, ...) without re-reading it.
+ */
+static void
+git_branch_read_head (const char *gitdir, char *branch, size_t branch_size, struct stat *head_stat)
+{
+    char head_path[MC_MAXPATHLEN * 2];
+    char content[128];
+    int fd;
+
+    branch[0] = '\0';
+    memset (head_stat, 0, sizeof (*head_stat));
+
+    g_strlcpy (head_path, gitdir, sizeof (head_path));
+    strcat (head_path, "/HEAD");
+
+    fd = open (head_path, O_RDONLY);
+    if (fd < 0)
+        return;
+
+    if (fstat (fd, head_stat) != 0)
+    {
+        close (fd);
+        return;
+    }
+
+    {
+        ssize_t n = read (fd, content, sizeof (content) - 1);
+
+        close (fd);
+
+        if (n <= 0)
+            return;
+
+        content[n] = '\0';
+        while (n > 0 && (content[n - 1] == '\n' || content[n - 1] == '\r'))
+            content[--n] = '\0';
+
+        if (strncmp (content, "ref: ", 5) == 0 && strncmp (content + 5, "refs/heads/", 11) == 0)
+            g_strlcpy (branch, content + 16, branch_size);
+        // Detached HEAD (raw object name) or some other ref: no current branch
+    }
+}
+
 static void
 show_git_branch (const WPanel *panel, int used_by_free_space)
 {
+    // The branch is read from the repository's HEAD file directly instead of
+    // forking 'git branch' on every redraw: no fork+exec on each panel draw
+    // (a full repository discovery is costly on remote or otherwise slow
+    // filesystems) and, importantly, no SIGCHLD from a child process racing
+    // with the subshell's stop/synchronize protocol.
+    // The result is cached per panel and refreshed when the panel directory
+    // changes, when HEAD's stat() changes (throttled), or, for non-git
+    // directories, when .git appears (throttled).
+    static const WPanel *cache_panel = NULL;
+    static char cache_dir[MC_MAXPATHLEN];
+    static char cache_gitdir[MC_MAXPATHLEN * 2];  // empty: not a git repository
+    static char cache_branch[BUF_SMALL];
+    static struct stat cache_head_stat;
+    static time_t cache_head_check = 0;
+    static time_t cache_git_check = 0;
+    static int cache_valid = 0;
+
     const Widget *w = CONST_WIDGET (panel);
     char branch[BUF_SMALL], tmp[BUF_SMALL];
-    char current_dir[MC_MAXPATHLEN];
-    FILE *gitcmd = NULL;
-    int gitret = -1;
 
     // Don't try to check git branch on non-local fs
     if (!vfs_file_is_local (panel->cwd_vpath) || !git_branch)
         return;
 
-    if (!getcwd (current_dir, sizeof(current_dir) - 1))
-        return;
-
-    if (chdir (panel->cwd_vpath->str) != 0)
-        return;
-
-    gitcmd = popen ("git branch --show-current 2>&1", "r");
-    if (gitcmd == NULL)
+    if (cache_valid && cache_panel == panel && strcmp (cache_dir, panel->cwd_vpath->str) == 0)
     {
-        if (!chdir (current_dir)) {};
-        return;
-    }
+        const time_t now = time (NULL);
 
-    if (!fgets (branch, sizeof (branch), gitcmd))
-    {
-        gitret = pclose (gitcmd);
-        if (!chdir (current_dir)) {};
-        return;
-    }
-    else
-    {
-        branch[sizeof (branch) - 1] = '\0';
-        int l = (int) strlen(branch) - 1;
-        while (l >= 0 && (*(branch + l) == '\n' || *(branch + l) == '\r'))
+        if (cache_gitdir[0] != '\0')
         {
-            *(branch + l) = '\0';
-            l--;
+            // Inside a repository: refresh the branch when HEAD changes
+            // (e.g. 'git checkout' run in the subshell or in another terminal)
+            if (now - cache_head_check >= GIT_BRANCH_REFRESH_SECS)
+            {
+                struct stat st;
+                char head_path[MC_MAXPATHLEN * 2];
+
+                cache_head_check = now;
+
+                g_strlcpy (head_path, cache_gitdir, sizeof (head_path));
+                strcat (head_path, "/HEAD");
+
+                if (stat (head_path, &st) == 0
+                    && (st.st_ino != cache_head_stat.st_ino
+                        || st.st_mtim.tv_sec != cache_head_stat.st_mtim.tv_sec
+                        || st.st_mtim.tv_nsec != cache_head_stat.st_mtim.tv_nsec))
+                {
+                    // HEAD changed (git checkout, reset --hard, ...): re-read the branch
+                    git_branch_read_head (cache_gitdir, cache_branch, sizeof (cache_branch), &st);
+                    cache_head_stat = st;
+                }
+                // stat failed (repository removed/broken): keep the last known branch
+            }
+        }
+        else if (now - cache_git_check >= GIT_BRANCH_NOGIT_REFRESH_SECS)
+        {
+            // Not a repository: check rarely whether .git has appeared in
+            // the panel directory (a repository created in place)
+            char git_path[MC_MAXPATHLEN * 2];
+
+            cache_git_check = now;
+
+            g_strlcpy (git_path, panel->cwd_vpath->str, sizeof (git_path));
+            strcat (git_path, "/.git");
+
+            if (access (git_path, F_OK) == 0)
+                cache_valid = 0;  // rediscover below
         }
     }
-    gitret = pclose (gitcmd);
-    if (!chdir (current_dir)) {};
 
-    if (gitret == 0)
+    if (!cache_valid || cache_panel != panel || strcmp (cache_dir, panel->cwd_vpath->str) != 0)
     {
-        int avail_space = w->rect.cols - 5 - used_by_free_space;
-        if (avail_space > (int) strlen (" Git: X... "))
-        {
-            if (avail_space - 11 < (int) strlen (branch))
-                sprintf(branch + avail_space - 11, "...");
-            g_snprintf (tmp, sizeof (tmp), " Git: %s ", branch);
-        }
+        // (Re)discover the repository for this directory
+        git_branch_find_gitdir (panel->cwd_vpath->str, cache_gitdir, sizeof (cache_gitdir));
+
+        if (cache_gitdir[0] != '\0')
+            git_branch_read_head (cache_gitdir, cache_branch, sizeof (cache_branch),
+                                  &cache_head_stat);
         else
-            return;
+            cache_branch[0] = '\0';
+
+        g_strlcpy (cache_dir, panel->cwd_vpath->str, sizeof (cache_dir));
+        cache_panel = panel;
+        cache_valid = 1;
+        cache_head_check = time (NULL);
+        cache_git_check = cache_head_check;
+    }
+
+    if (cache_branch[0] == '\0')
+        return;
+
+    int avail_space = w->rect.cols - 5 - used_by_free_space;
+    if (avail_space > (int) strlen (" Git: X... "))
+    {
+        g_strlcpy (branch, cache_branch, sizeof (branch));
+        if (avail_space - 11 < (int) strlen (branch))
+            sprintf (branch + avail_space - 11, "...");
+        g_snprintf (tmp, sizeof (tmp), " Git: %s ", branch);
         widget_gotoyx (w, w->rect.lines - 1, 2);
         tty_setcolor (CORE_NORMAL_COLOR);
         tty_print_string (tmp);
